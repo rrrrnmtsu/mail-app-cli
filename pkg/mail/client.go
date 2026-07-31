@@ -2033,7 +2033,7 @@ func (c *Client) GetSignaturesJSON() ([]Signature, error) {
 	script := `
 const mail = Application('Mail');
 const result = [];
-const sigs = mail.signatures();
+const sigs = mail.signatures() || [];
 for (let i = 0; i < sigs.length; i++) {
 	try {
 		result.push({ name: sigs[i].name(), content: String(sigs[i].content()) });
