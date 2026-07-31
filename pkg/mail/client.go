@@ -1612,17 +1612,32 @@ func (c *Client) getInboxBasedUnified(mailboxType string, limit, offset int, wit
 	return sortAndSlice(messages, offset, limit), nil
 }
 
-// getSpecialMailboxUnified fetches messages from Mail.app's built-in special
-// mailbox collections (sentMailboxes, draftMailboxes, trashMailboxes,
-// junkMailboxes) via a single JXA call.  No per-message filtering is applied
-// since these views don't need unread/flagged filtering.
+// specialMailboxCandidates lists the mailbox display names to try, in
+// order, when resolving each unified view's target mailbox per-account.
+// Mail.app's own top-level shortcuts (`mail.sentMailboxes()` and friends)
+// don't resolve via JXA's account proxy (verified: every one of them,
+// including the basic `account.inbox()`, throws "Can't get object" even
+// though the equivalent AppleScript dictionary properties exist) — so
+// names are matched by hand against each account's mailbox tree instead,
+// the same way regular mailbox navigation already works around Gmail's
+// special-mailbox lookup quirk.
+var specialMailboxCandidates = map[string][]string{
+	"sent":   {"Sent Messages", "Sent", "送信済みメール", "送信済み"},
+	"drafts": {"Drafts", "下書き"},
+	"trash":  {"Trash", "Deleted Messages", "ゴミ箱"},
+	"junk":   {"Junk", "Spam", "迷惑メール"},
+}
+
+// getSpecialMailboxUnified fetches messages from each account's sent/
+// drafts/trash/junk mailbox by matching candidate display names against
+// that account's mailbox tree, merging the results. No per-message
+// filtering is applied since these views don't need unread/flagged
+// filtering.
 func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int, withContent bool) ([]Message, error) {
-	accessor := map[string]string{
-		"sent":   "sentMailboxes",
-		"drafts": "draftMailboxes",
-		"trash":  "trashMailboxes",
-		"junk":   "junkMailboxes",
-	}[mailboxType]
+	candidates, ok := specialMailboxCandidates[mailboxType]
+	if !ok {
+		return nil, fmt.Errorf("unknown special mailbox type: %s", mailboxType)
+	}
 
 	perLimit := limit + offset
 	if perLimit < 50 {
@@ -1634,22 +1649,33 @@ func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int,
 		contentField = "content: msg.content() || '',"
 	}
 
+	var namesJS strings.Builder
+	for i, name := range candidates {
+		if i > 0 {
+			namesJS.WriteString(", ")
+		}
+		fmt.Fprintf(&namesJS, "'%s'", escapeJSString(name))
+	}
+
 	script := fmt.Sprintf(`
 const mail = Application('Mail');
 const result = [];
-const mailboxes = mail.%s();
-
-for (let m = 0; m < mailboxes.length; m++) {
-	const mbox = mailboxes[m];
-	let accName = '';
-	let mboxName = '';
-	try { accName = mbox.account().name(); } catch(e) {
-		try { accName = mbox.account.name(); } catch(e2) { accName = ''; }
+const candidateNames = [%s];
+`+jsResolveMailbox+`
+const accounts = mail.accounts();
+for (let a = 0; a < accounts.length; a++) {
+	const acc = accounts[a];
+	let mbox = null;
+	for (let n = 0; n < candidateNames.length; n++) {
+		mbox = resolveMailbox(acc, candidateNames[n]);
+		if (mbox) break;
 	}
-	try { mboxName = mbox.name(); } catch(e) { mboxName = '%s'; }
+	if (!mbox) continue;
 
 	let messages;
 	try { messages = mbox.messages(); } catch(e) { continue; }
+	const accName = acc.name();
+	const mboxName = mbox.name();
 
 	// Cap per-mailbox before iterating
 	const cap = Math.min(messages.length, %d);
@@ -1676,7 +1702,7 @@ for (let m = 0; m < mailboxes.length; m++) {
 }
 
 JSON.stringify(result);
-`, accessor, mailboxType, perLimit, contentField)
+`, namesJS.String(), perLimit, contentField)
 
 	output, err := c.runJXA(script)
 	if err != nil {
