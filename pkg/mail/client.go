@@ -134,6 +134,18 @@ function resolveMailbox(acc, name) {
 }
 `
 
+// jsSetSignatureSnippet returns a JXA statement that attaches an existing
+// signature (by name) to the given outgoing-message variable, or an empty
+// string when no signature was requested. Wrapped in its own try/catch so
+// an unknown signature name doesn't abort the send.
+func jsSetSignatureSnippet(varName, signatureName string) string {
+	if signatureName == "" {
+		return ""
+	}
+	return fmt.Sprintf(`try { %s.messageSignature = mail.signatures.byName('%s'); } catch (e) {}`,
+		varName, escapeJSString(signatureName))
+}
+
 func (c *Client) GetAccounts() ([]Account, error) {
 	script := `
 	tell application "Mail"
@@ -388,7 +400,7 @@ try {
 }
 
 // SendMessage sends a new email message
-func (c *Client) SendMessage(accountName, subject, body string, to, cc, bcc, attachments []string) error {
+func (c *Client) SendMessage(accountName, subject, body string, to, cc, bcc, attachments []string, signatureName string) error {
 	// Escape all recipients
 	var toList, ccList, bccList string
 	var escapedTo, escapedCc, escapedBcc []string
@@ -422,6 +434,19 @@ func (c *Client) SendMessage(accountName, subject, body string, to, cc, bcc, att
 	}
 	attachCode := attachCodeBuilder.String()
 
+	// Attach an existing signature by name, if requested. Wrapped in a try
+	// block since an unknown signature name shouldn't abort the send.
+	signatureCode := ""
+	if signatureName != "" {
+		signatureCode = fmt.Sprintf(`
+				try
+					set message signature to signature "%s"
+				on error
+					-- Unknown signature name: send without one rather than fail
+				end try
+`, escapeAppleScriptString(signatureName))
+	}
+
 	// AppleScript block
 	script := fmt.Sprintf(`
 	tell application "Mail"
@@ -448,6 +473,7 @@ func (c *Client) SendMessage(accountName, subject, body string, to, cc, bcc, att
 					end repeat
 				end if
 %s
+%s
 			send
 			end tell
 			return "Success"
@@ -459,6 +485,7 @@ func (c *Client) SendMessage(accountName, subject, body string, to, cc, bcc, att
 		toList,
 		ccList, ccList,
 		bccList, bccList,
+		signatureCode,
 		attachCode)
 
 	_, err := c.runAppleScript(script)
@@ -859,6 +886,7 @@ JSON.stringify(result);
 //   - message.deletedStatus is read-only.
 //   - Driving Mail's own Archive command works reliably but requires UI
 //     automation that activates Mail and steals focus.
+//
 // Archiving Gmail from the CLI therefore needs the Gmail API, not Mail.app.
 //
 // Other providers (Exchange, Fastmail, ...) do real moves, so a plain move
@@ -1187,14 +1215,14 @@ JSON.stringify(result);
 
 // GetMessagesFromMultipleMailboxes loads messages from multiple mailboxes concurrently
 func (c *Client) GetMessagesFromMultipleMailboxes(requests []struct {
-	AccountName  string
-	MailboxName  string
-	Limit        int
-	Offset       int
-	UnreadOnly   bool
-	FlaggedOnly  bool
-	WithContent  bool
-	Since        string
+	AccountName string
+	MailboxName string
+	Limit       int
+	Offset      int
+	UnreadOnly  bool
+	FlaggedOnly bool
+	WithContent bool
+	Since       string
 }) ([]Message, error) {
 	if len(requests) == 0 {
 		return []Message{}, nil
@@ -1216,14 +1244,14 @@ func (c *Client) GetMessagesFromMultipleMailboxes(requests []struct {
 	// Launch goroutine for each mailbox
 	for _, req := range requests {
 		go func(r struct {
-			AccountName  string
-			MailboxName  string
-			Limit        int
-			Offset       int
-			UnreadOnly   bool
-			FlaggedOnly  bool
-			WithContent  bool
-			Since        string
+			AccountName string
+			MailboxName string
+			Limit       int
+			Offset      int
+			UnreadOnly  bool
+			FlaggedOnly bool
+			WithContent bool
+			Since       string
 		}) {
 			messages, err := c.GetMessagesJSON(r.AccountName, r.MailboxName, r.Limit, r.Offset, r.UnreadOnly, r.FlaggedOnly, r.WithContent, r.Since)
 			results <- result{messages: messages, err: err}
@@ -1252,9 +1280,9 @@ func (c *Client) GetMessagesFromMultipleMailboxes(requests []struct {
 
 // GetMultipleMessageDetails loads full details for multiple messages concurrently
 func (c *Client) GetMultipleMessageDetails(requests []struct {
-	AccountName  string
-	MailboxName  string
-	MessageID    string
+	AccountName string
+	MailboxName string
+	MessageID   string
 }) ([]*Message, error) {
 	if len(requests) == 0 {
 		return []*Message{}, nil
@@ -1281,9 +1309,9 @@ func (c *Client) GetMultipleMessageDetails(requests []struct {
 	// Launch goroutine for each message
 	for i, req := range requests {
 		go func(idx int, r struct {
-			AccountName  string
-			MailboxName  string
-			MessageID    string
+			AccountName string
+			MailboxName string
+			MessageID   string
 		}) {
 			message, err := c.GetMessageDetailsJSON(r.AccountName, r.MailboxName, r.MessageID)
 			results <- result{message: message, err: err, index: idx}
@@ -1681,10 +1709,10 @@ func sortAndSlice(messages []Message, offset, limit int) []Message {
 }
 
 func (c *Client) BulkMoveMessages(requests []struct {
-	AccountName    string
-	SourceMailbox  string
-	MessageID      string
-	TargetMailbox  string
+	AccountName   string
+	SourceMailbox string
+	MessageID     string
+	TargetMailbox string
 }) error {
 	if len(requests) == 0 {
 		return nil
@@ -1702,10 +1730,10 @@ func (c *Client) BulkMoveMessages(requests []struct {
 	// Launch goroutine for each move operation
 	for _, req := range requests {
 		go func(r struct {
-			AccountName    string
-			SourceMailbox  string
-			MessageID      string
-			TargetMailbox  string
+			AccountName   string
+			SourceMailbox string
+			MessageID     string
+			TargetMailbox string
 		}) {
 			errors <- c.MoveMessage(r.AccountName, r.SourceMailbox, r.MessageID, r.TargetMailbox)
 		}(req)
@@ -1724,4 +1752,276 @@ func (c *Client) BulkMoveMessages(requests []struct {
 	}
 
 	return nil
+}
+
+// ReplyMessage creates and sends a reply using Mail.app's own `reply`
+// command, so the outgoing message carries Mail.app's native
+// reply-tracking (subject "Re: ...", correct sender/recipient inference,
+// and the internal thread linkage Mail.app uses on send) instead of being
+// composed as an unrelated new message.
+//
+// Mail.app does not reliably pre-populate the reply's quoted body via
+// scripting on current macOS (verified: content of a freshly-created reply
+// is empty whether read immediately, after a delay, or with the compose
+// window visible), so callers must pass the full body text — including any
+// quoted original — to set.
+func (c *Client) ReplyMessage(accountName, mailboxName, messageID string, replyToAll bool, body, signatureName string) error {
+	replyAllJS := "false"
+	if replyToAll {
+		replyAllJS = "true"
+	}
+
+	setContent := ""
+	if body != "" {
+		setContent = fmt.Sprintf("replyMsg.content = '%s';", escapeJSString(body))
+	}
+	setSignature := jsSetSignatureSnippet("replyMsg", signatureName)
+
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+try {
+	const acc = mail.accounts.byName('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';
+	const allIds = mbox.messages.id();
+	const targetIdx = allIds.findIndex(id => String(id) === '%s');
+	if (targetIdx < 0) throw 'Message not found';
+	const original = mbox.messages.at(targetIdx);
+	const replyMsg = mail.reply(original, { openingWindow: false, replyToAll: %s });
+	%s
+	%s
+	mail.send(replyMsg);
+	'Success';
+} catch (e) {
+	'Error: ' + e;
+}
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), replyAllJS, setContent, setSignature)
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(output, "Error") {
+		return fmt.Errorf(output)
+	}
+	return nil
+}
+
+// ForwardMessage creates and sends a forward using Mail.app's own `forward`
+// command (subject "Fwd: ...", real forward-tracking). Recipients are not
+// inherited from the original message and must be supplied.
+func (c *Client) ForwardMessage(accountName, mailboxName, messageID string, to, cc []string, body, signatureName string) error {
+	var toCode, ccCode strings.Builder
+	for _, addr := range to {
+		fmt.Fprintf(&toCode, "fwdMsg.toRecipients.push(mail.ToRecipient({address: '%s'}));\n", escapeJSString(addr))
+	}
+	for _, addr := range cc {
+		fmt.Fprintf(&ccCode, "fwdMsg.ccRecipients.push(mail.CcRecipient({address: '%s'}));\n", escapeJSString(addr))
+	}
+
+	setContent := ""
+	if body != "" {
+		setContent = fmt.Sprintf("fwdMsg.content = '%s';", escapeJSString(body))
+	}
+	setSignature := jsSetSignatureSnippet("fwdMsg", signatureName)
+
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+try {
+	const acc = mail.accounts.byName('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';
+	const allIds = mbox.messages.id();
+	const targetIdx = allIds.findIndex(id => String(id) === '%s');
+	if (targetIdx < 0) throw 'Message not found';
+	const original = mbox.messages.at(targetIdx);
+	const fwdMsg = mail.forward(original, { openingWindow: false });
+	%s
+	%s
+	%s
+	%s
+	mail.send(fwdMsg);
+	'Success';
+} catch (e) {
+	'Error: ' + e;
+}
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), toCode.String(), ccCode.String(), setContent, setSignature)
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(output, "Error") {
+		return fmt.Errorf(output)
+	}
+	return nil
+}
+
+// RedirectMessage resends a message verbatim (unchanged subject and body,
+// original sender preserved in the "From" the recipient sees) via Mail.app's
+// `redirect` command — the scriptable equivalent of the GUI's "Redirect...".
+func (c *Client) RedirectMessage(accountName, mailboxName, messageID string, to []string) error {
+	var toCode strings.Builder
+	for _, addr := range to {
+		fmt.Fprintf(&toCode, "rdMsg.toRecipients.push(mail.ToRecipient({address: '%s'}));\n", escapeJSString(addr))
+	}
+
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+try {
+	const acc = mail.accounts.byName('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';
+	const allIds = mbox.messages.id();
+	const targetIdx = allIds.findIndex(id => String(id) === '%s');
+	if (targetIdx < 0) throw 'Message not found';
+	const original = mbox.messages.at(targetIdx);
+	const rdMsg = mail.redirect(original, { openingWindow: false });
+	%s
+	mail.send(rdMsg);
+	'Success';
+} catch (e) {
+	'Error: ' + e;
+}
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), toCode.String())
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(output, "Error") {
+		return fmt.Errorf(output)
+	}
+	return nil
+}
+
+// SetJunkStatus marks or unmarks a message as junk mail. This sets Mail.app's
+// own junk-mail-status flag (verified writable), not just a mailbox move, so
+// it participates in whatever junk-filter training Mail.app does internally.
+func (c *Client) SetJunkStatus(accountName, mailboxName, messageID string, junk bool) error {
+	junkJS := "true"
+	if !junk {
+		junkJS = "false"
+	}
+
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+try {
+	const acc = mail.accounts.byName('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';
+	const allIds = mbox.messages.id();
+	const targetIdx = allIds.findIndex(id => String(id) === '%s');
+	if (targetIdx < 0) {
+		'Error: Message not found';
+	} else {
+		mbox.messages.at(targetIdx).junkMailStatus = %s;
+		'Success';
+	}
+} catch (e) {
+	'Error: ' + e;
+}
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), junkJS)
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(output, "Error") {
+		return fmt.Errorf(output)
+	}
+	return nil
+}
+
+// Rule represents a Mail.app message rule.
+type Rule struct {
+	Name    string
+	Enabled bool
+}
+
+// GetRulesJSON lists every configured Mail.app rule.
+func (c *Client) GetRulesJSON() ([]Rule, error) {
+	script := `
+const mail = Application('Mail');
+const result = [];
+const rules = mail.rules();
+for (let i = 0; i < rules.length; i++) {
+	try {
+		result.push({ name: rules[i].name(), enabled: rules[i].enabled() });
+	} catch (e) {}
+}
+JSON.stringify(result);
+`
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	var rules []Rule
+	if err := json.Unmarshal([]byte(output), &rules); err != nil {
+		return nil, fmt.Errorf("failed to parse rules JSON: %w", err)
+	}
+	return rules, nil
+}
+
+// SetRuleEnabled enables or disables a rule by name.
+func (c *Client) SetRuleEnabled(name string, enabled bool) error {
+	enabledJS := "true"
+	if !enabled {
+		enabledJS = "false"
+	}
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+try {
+	const rules = mail.rules();
+	const target = rules.find(r => r.name() === '%s');
+	if (!target) throw 'Rule not found';
+	target.enabled = %s;
+	'Success';
+} catch (e) {
+	'Error: ' + e;
+}
+`, escapeJSString(name), enabledJS)
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(output, "Error") {
+		return fmt.Errorf(output)
+	}
+	return nil
+}
+
+// Signature represents a Mail.app signature.
+type Signature struct {
+	Name    string
+	Content string
+}
+
+// GetSignaturesJSON lists every configured Mail.app signature.
+func (c *Client) GetSignaturesJSON() ([]Signature, error) {
+	script := `
+const mail = Application('Mail');
+const result = [];
+const sigs = mail.signatures();
+for (let i = 0; i < sigs.length; i++) {
+	try {
+		result.push({ name: sigs[i].name(), content: String(sigs[i].content()) });
+	} catch (e) {}
+}
+JSON.stringify(result);
+`
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	var sigs []Signature
+	if err := json.Unmarshal([]byte(output), &sigs); err != nil {
+		return nil, fmt.Errorf("failed to parse signatures JSON: %w", err)
+	}
+	return sigs, nil
 }

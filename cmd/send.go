@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"os"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/intelligrit/mail-app-cli/pkg/mail"
@@ -17,6 +17,7 @@ var (
 	sendSubject     string
 	sendBody        string
 	sendAttachments []string
+	sendSignature   string
 )
 
 var sendCmd = &cobra.Command{
@@ -39,7 +40,7 @@ Examples:
 		}
 
 		client := mail.NewClient()
-		err := client.SendMessage(sendAccount, sendSubject, sendBody, sendTo, sendCc, sendBcc, sendAttachments)
+		err := client.SendMessage(sendAccount, sendSubject, sendBody, sendTo, sendCc, sendBcc, sendAttachments, sendSignature)
 		if err != nil {
 			return fmt.Errorf("failed to send message: %w", err)
 		}
@@ -61,6 +62,7 @@ func init() {
 	sendCmd.Flags().StringVarP(&sendSubject, "subject", "s", "", "Email subject (required)")
 	sendCmd.Flags().StringVarP(&sendBody, "body", "", "", "Email body content")
 	sendCmd.Flags().StringSliceVar(&sendAttachments, "attach", []string{}, "File paths to attach (can be specified multiple times)")
+	sendCmd.Flags().StringVar(&sendSignature, "signature", "", "Name of an existing Mail.app signature to attach (see: mail-app-cli signatures list)")
 
 	sendCmd.MarkFlagRequired("account")
 	sendCmd.MarkFlagRequired("to")

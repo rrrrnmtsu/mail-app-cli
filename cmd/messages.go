@@ -21,11 +21,17 @@ var (
 	msgUnread        bool
 	msgFlaggedFilter bool
 	msgWithContent   bool
-	msgRead         bool
-	msgFlaggedSet   bool
-	msgSince        string
+	msgRead          bool
+	msgFlaggedSet    bool
+	msgSince         string
 	msgNoCache       bool
 	msgForceRefresh  bool
+	msgJunkSet       bool
+	msgReplyAll      bool
+	msgBody          string
+	msgTo            []string
+	msgCc            []string
+	msgSignature     string
 )
 
 // sanitizeCacheKey replaces non-alphanumeric chars so the key is safe as a filename component.
@@ -273,6 +279,111 @@ var messagesMoveCmd = &cobra.Command{
 	},
 }
 
+var messagesReplyCmd = &cobra.Command{
+	Use:   "reply [message-id]",
+	Short: "Reply to a message",
+	Long: `Creates and sends a reply using Mail.app's own reply command, so the
+outgoing message carries Mail.app's native subject/recipient/thread
+handling instead of being composed as an unrelated new message.
+Mail.app does not reliably pre-fill the quoted original text via
+scripting, so pass the full body (including any quote) via --body.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		messageID := args[0]
+		if msgAccount == "" || msgMailbox == "" {
+			return fmt.Errorf("both --account and --mailbox are required")
+		}
+
+		client := mail.NewClient()
+		err := client.ReplyMessage(msgAccount, msgMailbox, messageID, msgReplyAll, msgBody, msgSignature)
+		if err != nil {
+			return fmt.Errorf("failed to reply: %w", err)
+		}
+		fmt.Println("Reply sent")
+		return nil
+	},
+}
+
+var messagesForwardCmd = &cobra.Command{
+	Use:   "forward [message-id]",
+	Short: "Forward a message",
+	Long: `Creates and sends a forward using Mail.app's own forward command.
+Recipients are not inherited from the original message and must be
+supplied via --to (and optionally --cc).`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		messageID := args[0]
+		if msgAccount == "" || msgMailbox == "" {
+			return fmt.Errorf("both --account and --mailbox are required")
+		}
+		if len(msgTo) == 0 {
+			return fmt.Errorf("at least one --to recipient is required")
+		}
+
+		client := mail.NewClient()
+		err := client.ForwardMessage(msgAccount, msgMailbox, messageID, msgTo, msgCc, msgBody, msgSignature)
+		if err != nil {
+			return fmt.Errorf("failed to forward: %w", err)
+		}
+		fmt.Println("Forward sent")
+		return nil
+	},
+}
+
+var messagesRedirectCmd = &cobra.Command{
+	Use:   "redirect [message-id]",
+	Short: "Redirect a message unchanged",
+	Long: `Resends a message verbatim (unchanged subject and body, original
+sender preserved) via Mail.app's redirect command — the scriptable
+equivalent of the GUI's "Redirect...".`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		messageID := args[0]
+		if msgAccount == "" || msgMailbox == "" {
+			return fmt.Errorf("both --account and --mailbox are required")
+		}
+		if len(msgTo) == 0 {
+			return fmt.Errorf("at least one --to recipient is required")
+		}
+
+		client := mail.NewClient()
+		err := client.RedirectMessage(msgAccount, msgMailbox, messageID, msgTo)
+		if err != nil {
+			return fmt.Errorf("failed to redirect: %w", err)
+		}
+		fmt.Println("Redirected")
+		return nil
+	},
+}
+
+var messagesMarkJunkCmd = &cobra.Command{
+	Use:   "mark-junk [message-id]",
+	Short: "Mark or unmark a message as junk",
+	Long: `Sets Mail.app's own junk-mail-status flag on a message (not just a
+mailbox move), so it participates in whatever junk-filter training
+Mail.app does internally.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		messageID := args[0]
+		if msgAccount == "" || msgMailbox == "" {
+			return fmt.Errorf("both --account and --mailbox are required")
+		}
+
+		client := mail.NewClient()
+		err := client.SetJunkStatus(msgAccount, msgMailbox, messageID, msgJunkSet)
+		if err != nil {
+			return fmt.Errorf("failed to set junk status: %w", err)
+		}
+
+		status := "unmarked as junk"
+		if msgJunkSet {
+			status = "marked as junk"
+		}
+		fmt.Printf("Message %s\n", status)
+		return nil
+	},
+}
+
 // newUnifiedCmd returns a cobra.Command for a unified mailbox view.
 // mailboxType must match one of the types understood by GetUnifiedMessagesJSON.
 func newUnifiedCmd(use, short, mailboxType string) *cobra.Command {
@@ -347,6 +458,10 @@ func init() {
 	messagesCmd.AddCommand(messagesDeleteCmd)
 	messagesCmd.AddCommand(messagesArchiveCmd)
 	messagesCmd.AddCommand(messagesMoveCmd)
+	messagesCmd.AddCommand(messagesReplyCmd)
+	messagesCmd.AddCommand(messagesForwardCmd)
+	messagesCmd.AddCommand(messagesRedirectCmd)
+	messagesCmd.AddCommand(messagesMarkJunkCmd)
 	// Unified view subcommands
 	messagesCmd.AddCommand(messagesInboxCmd)
 	messagesCmd.AddCommand(messagesUnreadCmd)
@@ -375,6 +490,21 @@ func init() {
 
 	// Flag-specific flags
 	messagesFlagCmd.Flags().BoolVarP(&msgFlaggedSet, "flagged", "f", true, "Flag message (default) or use --flagged=false to unflag")
+
+	// Reply/forward/redirect-specific flags
+	messagesReplyCmd.Flags().BoolVar(&msgReplyAll, "all", false, "Reply to all recipients instead of just the sender")
+	messagesReplyCmd.Flags().StringVar(&msgBody, "body", "", "Body text to send (Mail.app does not reliably auto-quote the original via scripting)")
+	messagesReplyCmd.Flags().StringVar(&msgSignature, "signature", "", "Name of an existing Mail.app signature to attach")
+
+	messagesForwardCmd.Flags().StringSliceVarP(&msgTo, "to", "t", []string{}, "To recipients (can be specified multiple times, required)")
+	messagesForwardCmd.Flags().StringSliceVarP(&msgCc, "cc", "c", []string{}, "Cc recipients (can be specified multiple times)")
+	messagesForwardCmd.Flags().StringVar(&msgBody, "body", "", "Body text to prepend")
+	messagesForwardCmd.Flags().StringVar(&msgSignature, "signature", "", "Name of an existing Mail.app signature to attach")
+
+	messagesRedirectCmd.Flags().StringSliceVarP(&msgTo, "to", "t", []string{}, "To recipients (can be specified multiple times, required)")
+
+	// Mark-junk-specific flags
+	messagesMarkJunkCmd.Flags().BoolVar(&msgJunkSet, "junk", true, "Mark as junk (default) or use --junk=false to unmark")
 
 	// Unified view flags (shared across all unified subcommands)
 	for _, cmd := range []*cobra.Command{
