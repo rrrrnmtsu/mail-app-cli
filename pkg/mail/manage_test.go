@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -236,5 +237,16 @@ func compile(t *testing.T, dir, name, lang, src string) {
 	cmd.Stdin = strings.NewReader(src)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("%s (%s) does not compile: %v\n%s", name, lang, err, b)
+	}
+}
+
+func TestExplainMailboxDeleteErrorNamesTheWayOut(t *testing.T) {
+	got := explainMailboxDeleteError(errors.New("Error: AppleEventのハンドラで誤りが起きました。 (-10000)"))
+	if !strings.Contains(got.Error(), "delete it in Mail.app") {
+		t.Fatalf("handler failure should point at Mail.app, got %q", got)
+	}
+	other := errors.New("mailbox not found: x")
+	if explainMailboxDeleteError(other) != other {
+		t.Fatal("unrelated errors must pass through unchanged")
 	}
 }

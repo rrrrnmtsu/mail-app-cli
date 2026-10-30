@@ -432,9 +432,22 @@ func (c *Client) DeleteMailbox(accountName, spec string, force bool) (*MailboxIn
 		Path    string `json:"path"`
 	}
 	if err := c.runJXAJSON(buildMailboxDeleteScript(accountName, info.Path, force), &res); err != nil {
-		return nil, err
+		return nil, explainMailboxDeleteError(err)
 	}
 	return &MailboxInfo{Account: res.Account, Path: res.Path, Messages: info.Messages, Children: info.Children}, nil
+}
+
+// explainMailboxDeleteError turns Mail's generic handler failure (-10000)
+// into what it actually means. Mail.app's `delete` command rejects
+// mailboxes outright — verified on macOS with `delete mailbox "x"`,
+// `delete mailbox "c" of mailbox "p"` and `delete (first mailbox whose
+// name is "x")`, all -10000 — so the user has to delete it in Mail.app.
+func explainMailboxDeleteError(err error) error {
+	msg := err.Error()
+	if strings.Contains(msg, "-10000") || strings.Contains(msg, "AppleEvent") {
+		return fmt.Errorf("Mail.app does not allow deleting mailboxes via scripting; delete it in Mail.app (Mailbox > Delete Mailbox). Underlying error: %w", err)
+	}
+	return err
 }
 
 // ---------------------------------------------------------------------------
