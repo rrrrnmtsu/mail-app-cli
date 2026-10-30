@@ -133,7 +133,7 @@ func TestGeneratedScriptsEscapeUserInput(t *testing.T) {
 		buildMailboxInspectScript(hostile, hostile),
 		buildMailboxRenameScript(hostile, hostile, hostile),
 		buildMailboxDeleteScript(hostile, hostile, false),
-		buildCreateRuleScript(RuleSpec{Name: hostile, From: hostile, Subject: hostile, To: hostile, MoveTo: "acc/" + hostile, FlagColor: 3}),
+		buildRuleMoveTargetScript(hostile, hostile),
 		buildDeleteRuleScript(hostile),
 		buildDraftsSnapshotScript(hostile),
 		buildDraftsPollScript(hostile, hostile, hostile, []string{hostile}, 1),
@@ -209,7 +209,7 @@ func TestGeneratedScriptsCompile(t *testing.T) {
 		"mbInspect":    buildMailboxInspectScript("a", "n"),
 		"mbRename":     buildMailboxRenameScript("a", "n", "m"),
 		"mbDelete":     buildMailboxDeleteScript("a", "n", true),
-		"ruleCreate":   buildCreateRuleScript(spec),
+		"ruleTarget":   buildRuleMoveTargetScript("On My Mac", "x"),
 		"ruleDelete":   buildDeleteRuleScript("n"),
 		"draftSnap":    buildDraftsSnapshotScript("a"),
 		"draftPoll":    buildDraftsPollScript("a", "m", "s", []string{"1"}, 1),
@@ -224,6 +224,8 @@ func TestGeneratedScriptsCompile(t *testing.T) {
 		"attachSend":    buildAttachAndSendAppleScript(42, []string{"/tmp/x"}),
 		"draft":         buildOutgoingAppleScript(OutgoingMessage{Account: "a", Subject: "s", To: []string{"t"}, Attachments: []string{"/tmp/x"}, Signature: "sig"}, "save newMessage", true),
 		"send":          buildOutgoingAppleScript(OutgoingMessage{Account: "a", Subject: "s", To: []string{"t"}}, "send", false),
+		"ruleCreate":    buildCreateRuleAppleScript(spec, "x", true),
+		"ruleCreateAcc": buildCreateRuleAppleScript(RuleSpec{Name: "n", Subject: "s", MoveTo: "a/p/x", FlagColor: -1}, "p/x", false),
 	}
 	for name, src := range as {
 		compile(t, dir, name, "AppleScript", src)
@@ -248,5 +250,18 @@ func TestExplainMailboxDeleteErrorNamesTheWayOut(t *testing.T) {
 	other := errors.New("mailbox not found: x")
 	if explainMailboxDeleteError(other) != other {
 		t.Fatal("unrelated errors must pass through unchanged")
+	}
+}
+
+func TestCreateRuleAppleScriptEscapesInputAndChecksConditionCount(t *testing.T) {
+	src := buildCreateRuleAppleScript(RuleSpec{Name: hostile, From: hostile, To: "t", FlagColor: -1, MarkRead: true}, "", false)
+	if strings.Contains(src, `(do shell script "id")`) {
+		t.Fatal("user input broke out of an AppleScript string literal")
+	}
+	if !strings.Contains(src, "is not 2 then error") {
+		t.Fatalf("expected a check for exactly the 2 requested conditions:\n%s", src)
+	}
+	if strings.Contains(src, "mark flagged") {
+		t.Fatal("no flag action was requested")
 	}
 }

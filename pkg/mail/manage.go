@@ -505,66 +505,70 @@ func (r RuleSpec) Validate() error {
 	return nil
 }
 
-func buildCreateRuleScript(r RuleSpec) string {
-	var conds strings.Builder
-	add := func(ruleType, expr string) {
-		if expr == "" {
-			return
-		}
-		fmt.Fprintf(&conds, "\tconds.push({ ruleType: %s, qualifier: 'does contain value', expression: %s });\n", jsQuote(ruleType), jsQuote(expr))
-	}
-	add("from header", r.From)
-	add("subject header", r.Subject)
-	add("to header", r.To)
+// buildRuleMoveTargetScript resolves a --move-to target with the same
+// tree walk every other command uses (byName is unreliable for Gmail), so
+// the AppleScript below can address it by its full path.
+func buildRuleMoveTargetScript(account, mailbox string) string {
+	return jsMain(fmt.Sprintf(`
+	const acc = getAccount(%s);
+	const r = resolveMailboxWithPath(acc, %s);
+	if (!r) throw 'Move target mailbox not found: ' + %s + '/' + %s;
+	return { path: r.path };
+`, jsQuote(account), jsQuote(mailbox), jsQuote(account), jsQuote(mailbox)))
+}
 
-	moveAcc, moveBox := "", ""
-	if r.MoveTo != "" {
-		moveAcc, moveBox, _ = ParseMoveTarget(r.MoveTo)
+// buildCreateRuleAppleScript builds the rule in AppleScript rather than
+// JXA: on a freshly made rule JXA returns null for ruleConditions(), so the
+// JXA version failed before adding any condition (seen on the real Mail.app).
+// movePath is empty when there is no move action.
+func buildCreateRuleAppleScript(r RuleSpec, movePath string, moveLocal bool) string {
+	var b strings.Builder
+	b.WriteString("tell application \"Mail\"\n")
+	fmt.Fprintf(&b, "\tif (name of rules) contains %s then error \"Rule already exists: \" & %s\n", asQuote(r.Name), asQuote(r.Name))
+	fmt.Fprintf(&b, "\tset r to make new rule at end of rules with properties {name:%s, enabled:false, all conditions must be met:true}\n", asQuote(r.Name))
+	b.WriteString("\ttry\n")
+	// Delete only if something is there: a failing delete on an empty list
+	// would roll back a rule that was fine.
+	b.WriteString("\t\tif (count of rule conditions of r) > 0 then delete every rule condition of r\n")
+	want := 0
+	for _, c := range []struct{ header, expr string }{
+		{"from header", r.From},
+		{"subject header", r.Subject},
+		{"to header", r.To},
+	} {
+		if c.expr == "" {
+			continue
+		}
+		want++
+		fmt.Fprintf(&b, "\t\tmake new rule condition at end of rule conditions of r with properties {rule type:%s, qualifier:does contain value, expression:%s}\n", c.header, asQuote(c.expr))
 	}
-	markRead, del := "false", "false"
 	if r.MarkRead {
-		markRead = "true"
+		b.WriteString("\t\tset mark read of r to true\n")
+	}
+	if r.FlagColor >= 0 {
+		fmt.Fprintf(&b, "\t\tset mark flagged of r to true\n\t\tset mark flag index of r to %d\n", r.FlagColor)
 	}
 	if r.DeleteMessage {
-		del = "true"
+		b.WriteString("\t\tset delete message of r to true\n")
 	}
-
-	return jsMain(fmt.Sprintf(`
-	const ruleName = %s;
-	if (mail.rules.name().indexOf(ruleName) >= 0) throw 'Rule already exists: ' + ruleName;
-	const conds = [];
-%s
-	let dest = null;
-	const moveAcc = %s, moveBox = %s;
-	if (moveAcc !== '') {
-		const r = resolveMailboxWithPath(getAccount(moveAcc), moveBox);
-		if (!r) throw 'Move target mailbox not found: ' + moveAcc + '/' + moveBox;
-		dest = r.mbox;
+	if movePath != "" {
+		target := "mailbox " + asQuote(movePath)
+		if !moveLocal {
+			acc, _, _ := ParseMoveTarget(r.MoveTo)
+			target += " of account " + asQuote(acc)
+		}
+		fmt.Fprintf(&b, "\t\tset move message of r to %s\n\t\tset should move message of r to true\n", target)
 	}
-	mail.rules.push(mail.Rule({ name: ruleName, enabled: false, allConditionsMustBeMet: true }));
-	const idx = mail.rules.name().lastIndexOf(ruleName);
-	if (idx < 0) throw 'Mail.app did not create the rule';
-	const rule = mail.rules[idx];
-	try {
-		// A freshly made rule can carry a placeholder condition; drop
-		// whatever exists before adding ours so only the requested
-		// conditions apply.
-		const pre = rule.ruleConditions();
-		for (let i = pre.length - 1; i >= 0; i--) mail.delete(pre[i]);
-		for (let i = 0; i < conds.length; i++) rule.ruleConditions.push(mail.RuleCondition(conds[i]));
-		if (%s) rule.markRead = true;
-		if (%d >= 0) { rule.markFlagged = true; rule.markFlagIndex = %d; }
-		if (%s) rule.deleteMessage = true;
-		if (dest) { rule.moveMessage = dest; rule.shouldMoveMessage = true; }
-		rule.enabled = true;
-		if (rule.ruleConditions.length !== conds.length) throw 'condition count mismatch after create';
-	} catch (e) {
-		// Never leave a half-configured (possibly match-everything) rule behind.
-		try { mail.delete(rule); } catch (e2) {}
-		throw 'Failed to configure rule, rolled back: ' + e;
-	}
-	return { name: rule.name(), enabled: rule.enabled(), conditions: rule.ruleConditions.length };
-`, jsQuote(r.Name), conds.String(), jsQuote(moveAcc), jsQuote(moveBox), markRead, r.FlagColor, r.FlagColor, del))
+	fmt.Fprintf(&b, "\t\tif (count of rule conditions of r) is not %d then error \"condition count mismatch after create\"\n", want)
+	b.WriteString("\t\tset enabled of r to true\n")
+	b.WriteString("\ton error errMsg\n")
+	// Never leave a half-configured (possibly match-everything) rule behind.
+	b.WriteString("\t\ttry\n\t\t\tdelete r\n\t\tend try\n")
+	b.WriteString("\t\terror \"Failed to configure rule, rolled back: \" & errMsg\n")
+	b.WriteString("\tend try\n")
+	b.WriteString("\treturn (name of r) & \"|\" & ((enabled of r) as text)\n")
+	b.WriteString("end tell\n")
+	return b.String()
 }
 
 // CreateRule creates an enabled rule whose conditions must all match.
@@ -572,14 +576,23 @@ func (c *Client) CreateRule(spec RuleSpec) (*Rule, error) {
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	var res struct {
-		Name    string `json:"name"`
-		Enabled bool   `json:"enabled"`
+	movePath, moveLocal := "", false
+	if spec.MoveTo != "" {
+		acc, box, _ := ParseMoveTarget(spec.MoveTo)
+		var res struct {
+			Path string `json:"path"`
+		}
+		if err := c.runJXAJSON(buildRuleMoveTargetScript(acc, box), &res); err != nil {
+			return nil, err
+		}
+		movePath, moveLocal = res.Path, IsLocalAccount(acc)
 	}
-	if err := c.runJXAJSON(buildCreateRuleScript(spec), &res); err != nil {
+	out, err := c.runAppleScript(buildCreateRuleAppleScript(spec, movePath, moveLocal))
+	if err != nil {
 		return nil, err
 	}
-	return &Rule{Name: res.Name, Enabled: res.Enabled}, nil
+	name, enabled, _ := strings.Cut(strings.TrimSpace(out), "|")
+	return &Rule{Name: name, Enabled: enabled == "true"}, nil
 }
 
 func buildDeleteRuleScript(name string) string {
