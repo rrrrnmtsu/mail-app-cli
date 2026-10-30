@@ -93,6 +93,7 @@ type Message struct {
 	DateReceived  string
 	Read          bool
 	Flagged       bool
+	FlagIndex     int // Mail's flag colour 0-6 (see FlagColorNames); -1 when unflagged
 	Deleted       bool
 	MessageSize   int
 	Content       string
@@ -115,7 +116,24 @@ type Attachment struct {
 // the account's mailbox tree. byName() specifiers are broken for Gmail
 // special mailboxes like "All Mail" ("Can't get object"), so scripts must
 // match names against enumerated mailbox objects instead.
-const jsResolveMailbox = `
+//
+// It also defines getAccount(), which resolves an account by name and maps
+// the local "On My Mac" store (not part of mail.accounts — its mailboxes are
+// the application's own top-level mailbox elements) to a pseudo-account with
+// the same name()/mailboxes() surface, so every script that walks mailboxes
+// works for local mailboxes too.
+var jsResolveMailbox = `
+const localAccountAliases = ` + jsLocalAccountAliases() + `;
+function getAccount(name) {
+	if (mail.accounts.name().indexOf(name) >= 0) return mail.accounts.byName(name);
+	if (localAccountAliases.indexOf(String(name).toLowerCase()) >= 0) {
+		return { isLocal: true, name: () => '` + LocalAccountName + `', mailboxes: () => mail.mailboxes() };
+	}
+	throw 'Account not found: ' + name;
+}
+// Any unknown property read on a real account specifier yields another
+// (truthy) specifier, so the pseudo-account marker must be compared strictly.
+function isLocalAccount(acc) { return acc.isLocal === true; }
 function resolveMailbox(acc, name) {
 	function walk(mailboxes) {
 		for (let j = 0; j < mailboxes.length; j++) {
@@ -304,7 +322,7 @@ func (c *Client) MarkMessageAsRead(accountName, mailboxName, messageID string, r
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -341,7 +359,7 @@ func (c *Client) FlagMessage(accountName, mailboxName, messageID string, flagged
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -373,7 +391,7 @@ func (c *Client) DeleteMessage(accountName, mailboxName, messageID string) error
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -401,93 +419,10 @@ try {
 
 // SendMessage sends a new email message
 func (c *Client) SendMessage(accountName, subject, body string, to, cc, bcc, attachments []string, signatureName string) error {
-	// Escape all recipients
-	var toList, ccList, bccList string
-	var escapedTo, escapedCc, escapedBcc []string
-
-	for _, addr := range to {
-		escapedTo = append(escapedTo, escapeAppleScriptString(addr))
-	}
-	toList = strings.Join(escapedTo, `", "`)
-
-	for _, addr := range cc {
-		escapedCc = append(escapedCc, escapeAppleScriptString(addr))
-	}
-	ccList = strings.Join(escapedCc, `", "`)
-
-	for _, addr := range bcc {
-		escapedBcc = append(escapedBcc, escapeAppleScriptString(addr))
-	}
-	bccList = strings.Join(escapedBcc, `", "`)
-
-	// Build attachment code
-	var attachCodeBuilder strings.Builder
-	for _, attPath := range attachments {
-		escapedPath := escapeAppleScriptString(attPath)
-		fmt.Fprintf(&attachCodeBuilder, `
-			try
-				make new attachment with properties {file name:"%s"} at after the last paragraph
-			on error
-				-- Skip files that can't be attached
-			end try
-`, escapedPath)
-	}
-	attachCode := attachCodeBuilder.String()
-
-	// Attach an existing signature by name, if requested. Wrapped in a try
-	// block since an unknown signature name shouldn't abort the send.
-	signatureCode := ""
-	if signatureName != "" {
-		signatureCode = fmt.Sprintf(`
-				try
-					set message signature to signature "%s"
-				on error
-					-- Unknown signature name: send without one rather than fail
-				end try
-`, escapeAppleScriptString(signatureName))
-	}
-
-	// AppleScript block
-	script := fmt.Sprintf(`
-	tell application "Mail"
-		try
-			set targetAccount to account "%s"
-			set newMessage to make new outgoing message with properties {subject:"%s", content:"%s", visible:false}
-
-			tell newMessage
-				set sender to (item 1 of (email addresses of targetAccount as list))
-
-				repeat with addr in {"%s"}
-					make new to recipient at end of to recipients with properties {address:addr}
-				end repeat
-
-				if "%s" is not "" then
-					repeat with addr in {"%s"}
-						make new cc recipient at end of cc recipients with properties {address:addr}
-					end repeat
-				end if
-
-				if "%s" is not "" then
-					repeat with addr in {"%s"}
-						make new bcc recipient at end of bcc recipients with properties {address:addr}
-					end repeat
-				end if
-%s
-%s
-			send
-			end tell
-			return "Success"
-		on error errMsg
-			return "Error: " & errMsg
-		end try
-	end tell
-`, escapeAppleScriptString(accountName), escapeAppleScriptString(subject), escapeAppleScriptString(body),
-		toList,
-		ccList, ccList,
-		bccList, bccList,
-		signatureCode,
-		attachCode)
-
+	script := buildOutgoingAppleScript(OutgoingMessage{
+		Account: accountName, Subject: subject, Body: body,
+		To: to, Cc: cc, Bcc: bcc, Attachments: attachments, Signature: signatureName,
+	}, "send", false)
 	_, err := c.runAppleScript(script)
 	return err
 }
@@ -663,9 +598,9 @@ func (c *Client) getMailboxesForSingleAccount(accountName string) ([]Mailbox, er
 	script := fmt.Sprintf(`
 const mail = Application('Mail');
 const result = [];
-
+`+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const accName = acc.name();
 	const mailboxes = acc.mailboxes();
 	for (let j = 0; j < mailboxes.length; j++) {
@@ -744,7 +679,7 @@ const mail = Application('Mail');
 const result = [];
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const accName = acc.name();
@@ -774,6 +709,7 @@ try {
 				dateSent: (msg.dateSent() || new Date()).toISOString(),
 				read: msg.readStatus(),
 				flagged: msg.flaggedStatus(),
+				flagIndex: msg.flagIndex(),
 				messageSize: 0,
 				%s
 				mailbox: mboxName,
@@ -810,7 +746,7 @@ const mail = Application('Mail');
 let result = null;
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -843,6 +779,7 @@ try {
 			dateSent: (msg.dateSent() || new Date()).toISOString(),
 			read: msg.readStatus(),
 			flagged: msg.flaggedStatus(),
+			flagIndex: msg.flagIndex(),
 			messageSize: msg.messageSize(),
 			content: msg.content() || '',
 			mailbox: mbox.name(),
@@ -896,7 +833,7 @@ func (c *Client) ArchiveMessage(accountName, mailboxName, messageID string) erro
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Source mailbox not found';
 	const allIds = mbox.messages.id();
@@ -938,7 +875,7 @@ func (c *Client) MoveMessage(accountName, sourceMailbox, messageID, targetMailbo
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const sourceMbox = resolveMailbox(acc, '%s');
 	if (!sourceMbox) throw 'Source mailbox not found';
 	const destMbox = resolveMailbox(acc, '%s');
@@ -975,7 +912,7 @@ const mail = Application('Mail');
 const result = [];
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -1025,7 +962,7 @@ const app = Application.currentApplication();
 app.includeStandardAdditions = true;
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -1158,7 +1095,7 @@ const searchTerm = '%s'.toLowerCase();
 const maxResults = %d;
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const accName = acc.name();
@@ -1184,6 +1121,7 @@ try {
 					dateSent: (msg.dateSent() || new Date()).toISOString(),
 					read: msg.readStatus(),
 					flagged: msg.flaggedStatus(),
+					flagIndex: msg.flagIndex(),
 					messageSize: msg.messageSize(),
 					mailbox: mboxName,
 					account: accName
@@ -1692,6 +1630,7 @@ for (let a = 0; a < accounts.length; a++) {
 				dateSent: (msg.dateSent() || new Date()).toISOString(),
 				read: msg.readStatus(),
 				flagged: msg.flaggedStatus(),
+				flagIndex: msg.flagIndex(),
 				messageSize: 0,
 				%s
 				mailbox: mboxName,
@@ -1791,7 +1730,11 @@ func (c *Client) BulkMoveMessages(requests []struct {
 // is empty whether read immediately, after a delay, or with the compose
 // window visible), so callers must pass the full body text — including any
 // quoted original — to set.
-func (c *Client) ReplyMessage(accountName, mailboxName, messageID string, replyToAll bool, body, signatureName string) error {
+//
+// With attachments, the reply is prepared here but not sent: its outgoing
+// message id is handed to attachAndSend, which adds the files with the same
+// AppleScript mechanism `send --attach` uses and then sends.
+func (c *Client) ReplyMessage(accountName, mailboxName, messageID string, replyToAll bool, body, signatureName string, attachments []string) error {
 	replyAllJS := "false"
 	if replyToAll {
 		replyAllJS = "true"
@@ -1807,7 +1750,7 @@ func (c *Client) ReplyMessage(accountName, mailboxName, messageID string, replyT
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -1817,27 +1760,20 @@ try {
 	const replyMsg = mail.reply(original, { openingWindow: false, replyToAll: %s });
 	%s
 	%s
-	mail.send(replyMsg);
-	'Success';
+	%s
 } catch (e) {
 	'Error: ' + e;
 }
-`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), replyAllJS, setContent, setSignature)
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), replyAllJS, setContent, setSignature, jsFinishOutgoing("replyMsg", len(attachments) > 0))
 
-	output, err := c.runJXA(script)
-	if err != nil {
-		return err
-	}
-	if strings.Contains(output, "Error") {
-		return fmt.Errorf(output)
-	}
-	return nil
+	return c.finishOutgoing(script, attachments)
 }
 
 // ForwardMessage creates and sends a forward using Mail.app's own `forward`
 // command (subject "Fwd: ...", real forward-tracking). Recipients are not
 // inherited from the original message and must be supplied.
-func (c *Client) ForwardMessage(accountName, mailboxName, messageID string, to, cc []string, body, signatureName string) error {
+// Attachments are handled as in ReplyMessage.
+func (c *Client) ForwardMessage(accountName, mailboxName, messageID string, to, cc []string, body, signatureName string, attachments []string) error {
 	var toCode, ccCode strings.Builder
 	for _, addr := range to {
 		fmt.Fprintf(&toCode, "fwdMsg.toRecipients.push(mail.ToRecipient({address: '%s'}));\n", escapeJSString(addr))
@@ -1856,7 +1792,7 @@ func (c *Client) ForwardMessage(accountName, mailboxName, messageID string, to, 
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -1868,21 +1804,42 @@ try {
 	%s
 	%s
 	%s
-	mail.send(fwdMsg);
-	'Success';
+	%s
 } catch (e) {
 	'Error: ' + e;
 }
-`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), toCode.String(), ccCode.String(), setContent, setSignature)
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), toCode.String(), ccCode.String(), setContent, setSignature, jsFinishOutgoing("fwdMsg", len(attachments) > 0))
 
+	return c.finishOutgoing(script, attachments)
+}
+
+// jsFinishOutgoing ends a reply/forward script: send immediately, or (when
+// attachments follow) report the prepared outgoing message's id instead.
+func jsFinishOutgoing(varName string, prepareOnly bool) string {
+	if prepareOnly {
+		return fmt.Sprintf("'Prepared:' + %s.id();", varName)
+	}
+	return fmt.Sprintf("mail.send(%s);\n\t'Success';", varName)
+}
+
+// finishOutgoing runs a reply/forward script and, if it only prepared the
+// message, attaches the files and sends it.
+func (c *Client) finishOutgoing(script string, attachments []string) error {
 	output, err := c.runJXA(script)
 	if err != nil {
 		return err
 	}
-	if strings.Contains(output, "Error") {
-		return fmt.Errorf(output)
+	if strings.HasPrefix(output, "Error") {
+		return fmt.Errorf("%s", output)
 	}
-	return nil
+	if len(attachments) == 0 {
+		return nil
+	}
+	var id int
+	if _, err := fmt.Sscanf(output, "Prepared:%d", &id); err != nil {
+		return fmt.Errorf("unexpected output while preparing message: %q", output)
+	}
+	return c.attachAndSend(id, attachments)
 }
 
 // RedirectMessage resends a message verbatim (unchanged subject and body,
@@ -1898,7 +1855,7 @@ func (c *Client) RedirectMessage(accountName, mailboxName, messageID string, to 
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
@@ -1937,7 +1894,7 @@ func (c *Client) SetJunkStatus(accountName, mailboxName, messageID string, junk 
 const mail = Application('Mail');
 `+jsResolveMailbox+`
 try {
-	const acc = mail.accounts.byName('%s');
+	const acc = getAccount('%s');
 	const mbox = resolveMailbox(acc, '%s');
 	if (!mbox) throw 'Mailbox not found';
 	const allIds = mbox.messages.id();
