@@ -32,6 +32,8 @@ var (
 	msgTo            []string
 	msgCc            []string
 	msgSignature     string
+	msgFlagColor     int
+	msgAttachments   []string
 )
 
 // sanitizeCacheKey replaces non-alphanumeric chars so the key is safe as a filename component.
@@ -181,8 +183,10 @@ var messagesMarkCmd = &cobra.Command{
 var messagesFlagCmd = &cobra.Command{
 	Use:   "flag [message-id]",
 	Short: "Flag or unflag a message",
-	Long:  `Set or unset the flagged status of a message.`,
-	Args:  cobra.ExactArgs(1),
+	Long: `Set or unset the flagged status of a message.
+With --color N the message is flagged with Mail's flag colour N:
+0=red 1=orange 2=yellow 3=green 4=blue 5=purple 6=gray.`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		messageID := args[0]
 		if msgAccount == "" || msgMailbox == "" {
@@ -190,6 +194,17 @@ var messagesFlagCmd = &cobra.Command{
 		}
 
 		client := mail.NewClient()
+		if cmd.Flags().Changed("color") {
+			if err := validateFlagColorArgs(msgFlaggedSet, msgFlagColor); err != nil {
+				return err
+			}
+			if err := client.SetFlagColor(msgAccount, msgMailbox, messageID, msgFlagColor); err != nil {
+				return fmt.Errorf("failed to flag message: %w", err)
+			}
+			invalidateMailboxCache(msgAccount, msgMailbox)
+			fmt.Printf("Message flagged (%s)\n", mail.FlagColorNames[msgFlagColor])
+			return nil
+		}
 		err := client.FlagMessage(msgAccount, msgMailbox, messageID, msgFlaggedSet)
 		if err != nil {
 			return fmt.Errorf("failed to flag message: %w", err)
@@ -295,7 +310,11 @@ scripting, so pass the full body (including any quote) via --body.`,
 		}
 
 		client := mail.NewClient()
-		err := client.ReplyMessage(msgAccount, msgMailbox, messageID, msgReplyAll, msgBody, msgSignature)
+		attachments, err := mail.ResolveAttachmentPaths(msgAttachments)
+		if err != nil {
+			return err
+		}
+		err = client.ReplyMessage(msgAccount, msgMailbox, messageID, msgReplyAll, msgBody, msgSignature, attachments)
 		if err != nil {
 			return fmt.Errorf("failed to reply: %w", err)
 		}
@@ -321,7 +340,11 @@ supplied via --to (and optionally --cc).`,
 		}
 
 		client := mail.NewClient()
-		err := client.ForwardMessage(msgAccount, msgMailbox, messageID, msgTo, msgCc, msgBody, msgSignature)
+		attachments, err := mail.ResolveAttachmentPaths(msgAttachments)
+		if err != nil {
+			return err
+		}
+		err = client.ForwardMessage(msgAccount, msgMailbox, messageID, msgTo, msgCc, msgBody, msgSignature, attachments)
 		if err != nil {
 			return fmt.Errorf("failed to forward: %w", err)
 		}
@@ -382,6 +405,36 @@ Mail.app does internally.`,
 		fmt.Printf("Message %s\n", status)
 		return nil
 	},
+}
+
+var messagesOpenCmd = &cobra.Command{
+	Use:   "open [message-id]",
+	Short: "Open a message in Mail.app",
+	Long: `Brings Mail.app to the front with the message open in its own window.
+This activates Mail.app and takes focus.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		messageID := args[0]
+		if msgAccount == "" || msgMailbox == "" {
+			return fmt.Errorf("both --account and --mailbox are required")
+		}
+
+		client := mail.NewClient()
+		if err := client.OpenMessage(msgAccount, msgMailbox, messageID); err != nil {
+			return fmt.Errorf("failed to open message: %w", err)
+		}
+		fmt.Println("Message opened in Mail.app")
+		return nil
+	},
+}
+
+// validateFlagColorArgs rejects --color combined with --flagged=false and
+// out-of-range colours.
+func validateFlagColorArgs(flagged bool, color int) error {
+	if !flagged {
+		return fmt.Errorf("--color cannot be combined with --flagged=false")
+	}
+	return mail.ValidateFlagColor(color)
 }
 
 // newUnifiedCmd returns a cobra.Command for a unified mailbox view.
@@ -462,6 +515,7 @@ func init() {
 	messagesCmd.AddCommand(messagesForwardCmd)
 	messagesCmd.AddCommand(messagesRedirectCmd)
 	messagesCmd.AddCommand(messagesMarkJunkCmd)
+	messagesCmd.AddCommand(messagesOpenCmd)
 	// Unified view subcommands
 	messagesCmd.AddCommand(messagesInboxCmd)
 	messagesCmd.AddCommand(messagesUnreadCmd)
@@ -490,16 +544,19 @@ func init() {
 
 	// Flag-specific flags
 	messagesFlagCmd.Flags().BoolVarP(&msgFlaggedSet, "flagged", "f", true, "Flag message (default) or use --flagged=false to unflag")
+	messagesFlagCmd.Flags().IntVar(&msgFlagColor, "color", 0, "Flag colour 0-6 (0=red 1=orange 2=yellow 3=green 4=blue 5=purple 6=gray)")
 
 	// Reply/forward/redirect-specific flags
 	messagesReplyCmd.Flags().BoolVar(&msgReplyAll, "all", false, "Reply to all recipients instead of just the sender")
 	messagesReplyCmd.Flags().StringVar(&msgBody, "body", "", "Body text to send (Mail.app does not reliably auto-quote the original via scripting)")
 	messagesReplyCmd.Flags().StringVar(&msgSignature, "signature", "", "Name of an existing Mail.app signature to attach")
+	messagesReplyCmd.Flags().StringSliceVar(&msgAttachments, "attach", []string{}, "File paths to attach (can be specified multiple times)")
 
 	messagesForwardCmd.Flags().StringSliceVarP(&msgTo, "to", "t", []string{}, "To recipients (can be specified multiple times, required)")
 	messagesForwardCmd.Flags().StringSliceVarP(&msgCc, "cc", "c", []string{}, "Cc recipients (can be specified multiple times)")
 	messagesForwardCmd.Flags().StringVar(&msgBody, "body", "", "Body text to prepend")
 	messagesForwardCmd.Flags().StringVar(&msgSignature, "signature", "", "Name of an existing Mail.app signature to attach")
+	messagesForwardCmd.Flags().StringSliceVar(&msgAttachments, "attach", []string{}, "File paths to attach (can be specified multiple times)")
 
 	messagesRedirectCmd.Flags().StringSliceVarP(&msgTo, "to", "t", []string{}, "To recipients (can be specified multiple times, required)")
 
