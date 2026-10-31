@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -79,6 +80,47 @@ func (c *Client) CheckIndex(limit int) (*IndexCheckResult, error) {
 		}
 	}
 
+	// Flag colours are rare enough that a 30-message sample can miss every
+	// non-default one; compare the whole flagged view.
+	{
+		mb := IndexCheckMailbox{Account: "all accounts", Mailbox: "flagged (colours)"}
+		want, err := jxa.getInboxBasedUnified("flagged", 500, 0, false)
+		if err != nil {
+			mb.Skipped = "AppleScript failed: " + err.Error()
+		} else if got, ok := e.unified(accounts, "flagged", 500, 0); !ok {
+			mb.Mismatches = append(mb.Mismatches, "flagged view could not be built from the index")
+		} else {
+			mb.Compared = len(want)
+			mb.Mismatches = compareListings(want, got, 500)
+		}
+		res.Mailboxes = append(res.Mailboxes, mb)
+	}
+
+	// Unified drafts/trash/junk skip accounts that lack the mailbox, so a
+	// name the index can't match would silently drop an account instead of
+	// failing; compare which mailbox each side picks for every account.
+	picks, err := c.specialMailboxPicks(accounts)
+	if err != nil {
+		return nil, fmt.Errorf("AppleScript mailbox lookup failed: %w", err)
+	}
+	for _, acc := range accounts {
+		mb := IndexCheckMailbox{Account: acc.Name, Mailbox: "drafts/trash/junk/sent lookup"}
+		for _, kind := range []string{"sent", "drafts", "trash", "junk"} {
+			want := picks[acc.Name][kind]
+			got := ""
+			for _, n := range specialMailboxCandidates[kind] {
+				if _, ok := resolveIndexMailbox(all, acc.ID, n); ok {
+					got = n
+					break
+				}
+			}
+			if want != got {
+				mb.Mismatches = append(mb.Mismatches, fmt.Sprintf("%s: applescript=%q index=%q", kind, want, got))
+			}
+		}
+		res.Mailboxes = append(res.Mailboxes, mb)
+	}
+
 	res.OK = len(res.Mailboxes) > 0
 	compared := 0
 	for _, mb := range res.Mailboxes {
@@ -124,7 +166,8 @@ func compareListings(want, got []Message, limit int) []string {
 			continue
 		}
 		for _, d := range []struct{ field, a, b string }{
-			{"subject", w.Subject, g.Subject},
+			// The index drops trailing whitespace from subjects.
+			{"subject", strings.TrimRight(w.Subject, " \t"), strings.TrimRight(g.Subject, " \t")},
 			{"sender", normalizeSender(w.Sender), normalizeSender(g.Sender)},
 			{"dateReceived", w.DateReceived, g.DateReceived},
 			{"dateSent", w.DateSent, g.DateSent},
@@ -149,9 +192,12 @@ func compareListings(want, got []Message, limit int) []string {
 	return out
 }
 
-// normalizeSender ignores quoting differences around display names.
+// normalizeSender ignores quoting and the space before "<". AppleScript
+// returns the raw From header ("Name<addr>" when the sender wrote it so); the
+// index keeps name and address apart and can't say whether there was a space.
 func normalizeSender(s string) string {
-	return strings.Join(strings.Fields(strings.ReplaceAll(s, `"`, "")), " ")
+	s = strings.Join(strings.Fields(strings.ReplaceAll(s, `"`, "")), " ")
+	return strings.ReplaceAll(s, " <", "<")
 }
 
 // IndexStatus explains whether listings currently use the index.
@@ -160,4 +206,48 @@ func IndexStatus() string {
 		return "AppleScript (index off: " + err.Error() + ")"
 	}
 	return "Envelope Index (verified)"
+}
+
+// specialMailboxPicks returns, per account and unified kind, the first
+// candidate mailbox name AppleScript resolves ("" when none).
+func (c *Client) specialMailboxPicks(accounts []Account) (map[string]map[string]string, error) {
+	cands, err := json.Marshal(specialMailboxCandidates)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(accounts))
+	for _, a := range accounts {
+		names = append(names, a.Name)
+	}
+	accs, err := json.Marshal(names)
+	if err != nil {
+		return nil, err
+	}
+	script := `
+const mail = Application('Mail');
+` + jsResolveMailbox + `
+const candidates = ` + string(cands) + `;
+const out = {};
+for (const name of ` + string(accs) + `) {
+	out[name] = {};
+	let acc;
+	try { acc = getAccount(name); } catch (e) { continue; }
+	for (const kind of Object.keys(candidates)) {
+		out[name][kind] = '';
+		for (const n of candidates[kind]) {
+			if (resolveMailbox(acc, n)) { out[name][kind] = n; break; }
+		}
+	}
+}
+JSON.stringify(out);
+`
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	var picks map[string]map[string]string
+	if err := json.Unmarshal([]byte(output), &picks); err != nil {
+		return nil, err
+	}
+	return picks, nil
 }

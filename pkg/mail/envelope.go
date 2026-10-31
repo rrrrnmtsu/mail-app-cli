@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Mail.app keeps its message list in a SQLite database ("Envelope Index").
@@ -153,7 +155,10 @@ func (e *envelopeIndex) mailboxes() ([]indexMailbox, error) {
 			continue
 		}
 		segs := strings.Split(path, "/")
-		out = append(out, indexMailbox{RowID: r.RowID, AccountID: u.Host, Name: segs[len(segs)-1]})
+		// URLs store names decomposed (ゴ as コ + ゛); AppleScript returns
+		// them composed.
+		name := norm.NFC.String(segs[len(segs)-1])
+		out = append(out, indexMailbox{RowID: r.RowID, AccountID: u.Host, Name: name})
 	}
 	return out, nil
 }
@@ -163,7 +168,7 @@ func (e *envelopeIndex) mailboxes() ([]indexMailbox, error) {
 func resolveIndexMailbox(all []indexMailbox, accountID, name string) (indexMailbox, bool) {
 	var hit []indexMailbox
 	for _, m := range all {
-		if strings.EqualFold(m.AccountID, accountID) && m.Name == name {
+		if strings.EqualFold(m.AccountID, accountID) && m.Name == norm.NFC.String(name) {
 			hit = append(hit, m)
 		}
 	}
@@ -196,7 +201,8 @@ func (e *envelopeIndex) listMessages(targets []indexTarget, q indexQuery) ([]Mes
 		byRow[t.RowID] = t
 		ids = append(ids, strconv.FormatInt(t.RowID, 10))
 	}
-	where := []string{"m.mailbox IN (" + strings.Join(ids, ",") + ")", "m.deleted = 0"}
+	in := strings.Join(ids, ",")
+	where := []string{"m.deleted = 0"}
 	if q.UnreadOnly {
 		where = append(where, "m.read = 0")
 	}
@@ -216,12 +222,20 @@ func (e *envelopeIndex) listMessages(targets []indexTarget, q indexQuery) ([]Mes
 	} else if q.Offset > 0 {
 		limit = fmt.Sprintf(" LIMIT -1 OFFSET %d", q.Offset)
 	}
-	sql := `SELECT m.ROWID AS id,
+	// Gmail stores each message once, in All Mail; INBOX, Sent and user
+	// labels are rows in labels pointing at it. Other IMAP accounts keep
+	// messages.mailbox. The mailbox reported is the one asked for.
+	sql := `WITH hits(mid, box) AS (
+	SELECT ROWID, mailbox FROM messages WHERE mailbox IN (` + in + `)
+	UNION SELECT message_id, mailbox_id FROM labels WHERE mailbox_id IN (` + in + `)
+)
+SELECT m.ROWID AS id,
 	COALESCE(m.subject_prefix, '') || COALESCE(s.subject, '') AS subject,
 	COALESCE(a.address, '') AS address, COALESCE(a.comment, '') AS comment,
 	m.date_received AS received, m.date_sent AS sent,
-	m.read AS read, m.flagged AS flagged, m.flags AS flags, m.mailbox AS mailbox
-FROM messages m
+	m.read AS read, m.flagged AS flagged, m.flags AS flags, h.box AS mailbox
+FROM hits h
+JOIN messages m ON m.ROWID = h.mid
 LEFT JOIN subjects s ON s.ROWID = m.subject
 LEFT JOIN addresses a ON a.ROWID = m.sender
 WHERE ` + strings.Join(where, " AND ") + `
@@ -247,7 +261,10 @@ ORDER BY m.date_received DESC, m.ROWID DESC` + limit + ";"
 		t := byRow[r.Mailbox]
 		flagIndex := -1
 		if r.Flagged != 0 {
-			flagIndex = int((r.Flags >> 41) & 7)
+			// The flag_color column is just 1 whenever flagged; the colour
+			// itself sits in bits 39-41 of flags (matched against
+			// AppleScript's flag index by `index check`).
+			flagIndex = int((r.Flags >> 39) & 7)
 		}
 		out = append(out, Message{
 			ID:           strconv.FormatInt(r.ID, 10),
@@ -363,6 +380,10 @@ func (c *Client) indexUnified(mailboxType string, limit, offset int) ([]Message,
 	if err != nil {
 		return nil, false
 	}
+	return e.unified(accounts, mailboxType, limit, offset)
+}
+
+func (e *envelopeIndex) unified(accounts []Account, mailboxType string, limit, offset int) ([]Message, bool) {
 	q := indexQuery{Limit: limit, Offset: offset}
 	var candidates []string
 	var use []Account

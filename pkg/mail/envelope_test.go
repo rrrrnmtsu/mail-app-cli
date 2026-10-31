@@ -16,17 +16,23 @@ func buildIndex(t *testing.T) *envelopeIndex {
 CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
 CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
 CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+CREATE TABLE labels (message_id INTEGER, mailbox_id INTEGER);
 CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, subject_prefix TEXT, subject INTEGER, sender INTEGER,
   date_received INTEGER, date_sent INTEGER, read INTEGER, flagged INTEGER, flags INTEGER, mailbox INTEGER, deleted INTEGER);
 INSERT INTO mailboxes VALUES (1, 'imap://AAAA-1111/INBOX'), (2, 'imap://AAAA-1111/%5BGmail%5D/Sent%20Mail'),
-  (3, 'imap://BBBB-2222/INBOX'), (4, 'imap://BBBB-2222/Archive/INBOX');
+  (3, 'imap://BBBB-2222/INBOX'), (4, 'imap://BBBB-2222/Archive/INBOX'),
+  (5, 'imap://CCCC-3333/%5BGmail%5D/All%20Mail'), (6, 'imap://CCCC-3333/INBOX'),
+  (7, 'imap://CCCC-3333/%5BGmail%5D/%E3%82%B3%E3%82%99%E3%83%9F%E7%AE%B1');
 INSERT INTO subjects VALUES (1, 'hello'), (2, 'report');
 INSERT INTO addresses VALUES (1, 'a@example.com', 'Alice'), (2, 'b@example.com', '');
 INSERT INTO messages VALUES
   (10, '', 1, 1, 1700000300, 1700000200, 0, 0, 0, 1, 0),
-  (11, 'Re: ', 2, 2, 1700000100, 1700000000, 1, 1, 2199023255552, 1, 0),
+  (11, 'Re: ', 2, 2, 1700000100, 1700000000, 1, 1, 549755813888, 1, 0),
   (12, '', 1, 1, 1700000400, 1700000400, 0, 0, 0, 1, 1),
-  (13, '', 2, 2, 1700000500, 1700000500, 1, 0, 0, 2, 0);
+  (13, '', 2, 2, 1700000500, 1700000500, 1, 0, 0, 2, 0),
+  (20, '', 1, 1, 1700000600, 1700000600, 0, 0, 0, 5, 0),
+  (21, '', 2, 2, 1700000700, 1700000700, 0, 0, 0, 5, 0);
+INSERT INTO labels VALUES (20, 6);
 `
 	if out, err := exec.Command(sqliteBin, p, schema).CombinedOutput(); err != nil {
 		t.Fatalf("build fixture: %v %s", err, out)
@@ -127,5 +133,37 @@ func TestOpenVerifiedIndexOffWithoutMarker(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if IndexEnabled() {
 		t.Fatal("index must stay off until a check has passed")
+	}
+}
+
+func TestGmailInboxIsReadThroughLabels(t *testing.T) {
+	e := buildIndex(t)
+	all, _ := e.mailboxes()
+	inbox, ok := resolveIndexMailbox(all, "CCCC-3333", "INBOX")
+	if !ok {
+		t.Fatal("Gmail INBOX should resolve")
+	}
+	msgs, err := e.listMessages([]indexTarget{{RowID: inbox.RowID, AccountName: "G", MailboxName: "INBOX"}}, indexQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].ID != "20" || msgs[0].Mailbox != "INBOX" {
+		t.Fatalf("only the labelled All Mail message belongs to INBOX: %+v", msgs)
+	}
+}
+
+func TestDecomposedJapaneseMailboxNameMatchesComposed(t *testing.T) {
+	all, _ := buildIndex(t).mailboxes()
+	if _, ok := resolveIndexMailbox(all, "CCCC-3333", "ゴミ箱"); !ok {
+		t.Fatal("ゴミ箱 stored as コ+゛ in the URL must still resolve")
+	}
+}
+
+func TestSenderComparisonIgnoresSpaceBeforeAddress(t *testing.T) {
+	if normalizeSender("送信専用<a@b.jp>") != normalizeSender("送信専用 <a@b.jp>") {
+		t.Fatal("raw header without the space is the same sender")
+	}
+	if normalizeSender("A <a@b.jp>") == normalizeSender("B <a@b.jp>") {
+		t.Fatal("different display names must still differ")
 	}
 }
