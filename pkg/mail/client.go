@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os/exec"
 	"sort"
 	"strings"
 )
 
 // Client provides an interface to interact with Mail.app via AppleScript
-type Client struct{}
+type Client struct {
+	// noIndex forces AppleScript even when the Envelope Index is verified,
+	// so `index check` compares the index against the real thing.
+	noIndex bool
+}
 
 // NewClient creates a new Mail.app client
 func NewClient() *Client {
@@ -640,9 +645,50 @@ JSON.stringify(result);
 
 // GetMessagesJSON retrieves messages from a mailbox using JXA
 func (c *Client) GetMessagesJSON(accountName, mailboxName string, limit, offset int, unreadOnly, flaggedOnly, withContent bool, since string) ([]Message, error) {
-	// Build filter/offset/limit clauses using index-based approach.
-	// Bulk property accessors (mbox.messages.readStatus()) fetch all values in a
-	// single IPC call rather than one round-trip per message.
+	if !withContent {
+		q := indexQuery{Limit: limit, Offset: offset, UnreadOnly: unreadOnly, FlaggedOnly: flaggedOnly, Since: since}
+		if msgs, ok := c.indexListMessages(accountName, mailboxName, q); ok {
+			return msgs, nil
+		}
+	}
+	resolve := fmt.Sprintf(`
+	const acc = getAccount('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';`, escapeJSString(accountName), escapeJSString(mailboxName))
+
+	output, err := c.runJXA(messagesScript(resolve, limit, offset, unreadOnly, flaggedOnly, withContent, since))
+	if err != nil {
+		return nil, err
+	}
+
+	var messages []Message
+	if err := json.Unmarshal([]byte(output), &messages); err != nil {
+		return nil, fmt.Errorf("failed to parse messages JSON: %w", err)
+	}
+
+	return messages, nil
+}
+
+// A whole-mailbox bulk read is one Apple event but costs time per message in
+// the mailbox, and that rate differs by account type: measured ~0.07ms per
+// message on a plain IMAP INBOX and ~0.3ms on Gmail, against ~10ms per
+// per-message read. So the script times one bulk read (ids, needed either
+// way) and only then picks a path. bulkProbeRatio bounds the probe itself
+// to mailboxes small enough that wasting it is cheap. Ranged AppleScript
+// reads (`subject of messages 1 thru 50`) and index specifiers that skip
+// materialising the message list were both tried and are far slower.
+const bulkProbeRatio = 200
+
+func bulkProbeCap(limit int) int {
+	if limit <= 0 {
+		return math.MaxInt32
+	}
+	return limit * bulkProbeRatio
+}
+
+// messagesScript builds the JXA that lists one mailbox. resolveJS must
+// declare `acc` and `mbox` (throwing when the mailbox can't be found).
+func messagesScript(resolveJS string, limit, offset int, unreadOnly, flaggedOnly, withContent bool, since string) string {
 	unreadFilter := ""
 	if unreadOnly {
 		unreadFilter = "{ const rs = mbox.messages.readStatus(); indices = indices.filter(i => !rs[i]); }"
@@ -655,7 +701,6 @@ func (c *Client) GetMessagesJSON(accountName, mailboxName string, limit, offset 
 
 	sinceFilter := ""
 	if since != "" {
-		// Bulk-fetch all received dates in one IPC call, then filter by index
 		sinceFilter = fmt.Sprintf("{ const sd = new Date('%s'); const allDates = mbox.messages.dateReceived(); indices = indices.filter(i => { const d = allDates[i]; return d && d >= sd; }); }", escapeJSString(since))
 	}
 
@@ -669,52 +714,85 @@ func (c *Client) GetMessagesJSON(accountName, mailboxName string, limit, offset 
 		limitClause = fmt.Sprintf("if (indices.length > %d) indices = indices.slice(0, %d);", limit, limit)
 	}
 
-	contentField := "content: '',"
-	if withContent {
-		contentField = "content: msg.content() || '',"
-	}
-
-	script := fmt.Sprintf(`
+	return fmt.Sprintf(`
 const mail = Application('Mail');
 const result = [];
+const withContent = %t;
 `+jsResolveMailbox+`
 try {
-	const acc = getAccount('%s');
-	const mbox = resolveMailbox(acc, '%s');
-	if (!mbox) throw 'Mailbox not found';
+	%s
 	const accName = acc.name();
 	const mboxName = mbox.name();
-	const messages = mbox.messages();
+	// Counting via mbox.messages.length looks cheaper but is a separate
+	// whole-mailbox event (7s on a 28k-message Gmail INBOX).
+	const specs = mbox.messages();
+	const total = specs.length;
 
-	// Index array; all filtering operates on indices so property access is bulk/deferred
-	let indices = Array.from({length: messages.length}, (_, i) => i);
+	let indices = Array.from({length: total}, (_, i) => i);
+	%s
+	%s
+	%s
+	%s
+	%s
 
-	// Bulk property filters (1 IPC call each instead of N)
-	%s
-	%s
-	%s
-	%s
-	%s
+	let ids = null, P = null;
+	if (indices.length > 0 && total <= %d) {
+		const ms = mbox.messages;
+		const t0 = Date.now();
+		ids = ms.id();
+		const idMs = Date.now() - t0;
+		if (ids.length !== total) ids = null;
+		// Bulk: six more reads like the probe. Per-message: 7 reads of
+		// ~10ms per row.
+		if (ids && 6 * idMs < indices.length * 70) {
+			P = {
+				subject: ms.subject(), sender: ms.sender(),
+				dateReceived: ms.dateReceived(), dateSent: ms.dateSent(),
+				read: ms.readStatus(), flagIndex: ms.flagIndex(),
+				deleted: ms.deletedStatus()
+			};
+			// Each array is its own Apple event; mail arriving in between
+			// shifts the indices, and mismatched rows are worse than a slow read.
+			if (Object.keys(P).some(k => P[k].length !== total)) P = null;
+		}
+	}
 
 	for (let k = 0; k < indices.length; k++) {
 		const i = indices[k];
-		const msg = messages[i];
-		try { if (msg.deletedStatus()) continue; } catch(e) {}
 		try {
-			result.push({
-				id: String(msg.id()),
-				subject: msg.subject() || '',
-				sender: msg.sender() || '',
-				dateReceived: (msg.dateReceived() || new Date()).toISOString(),
-				dateSent: (msg.dateSent() || new Date()).toISOString(),
-				read: msg.readStatus(),
-				flagged: msg.flaggedStatus(),
-				flagIndex: msg.flagIndex(),
-				messageSize: 0,
-				%s
-				mailbox: mboxName,
-				account: accName
-			});
+			let row;
+			if (P) {
+				if (P.deleted[i]) continue;
+				row = {
+					id: String(ids[i]),
+					subject: P.subject[i] || '',
+					sender: P.sender[i] || '',
+					dateReceived: (P.dateReceived[i] || new Date()).toISOString(),
+					dateSent: (P.dateSent[i] || new Date()).toISOString(),
+					read: P.read[i],
+					// flag index is -1 exactly when unflagged, which saves a read.
+					flagged: P.flagIndex[i] >= 0,
+					flagIndex: P.flagIndex[i]
+				};
+			} else {
+				const msg = specs[i];
+				try { if (msg.deletedStatus()) continue; } catch(e) {}
+				row = {
+					id: String(ids ? ids[i] : msg.id()),
+					subject: msg.subject() || '',
+					sender: msg.sender() || '',
+					dateReceived: (msg.dateReceived() || new Date()).toISOString(),
+					dateSent: (msg.dateSent() || new Date()).toISOString(),
+					read: msg.readStatus(),
+					flagIndex: msg.flagIndex()
+				};
+				row.flagged = row.flagIndex >= 0;
+			}
+			row.messageSize = 0;
+			row.content = withContent ? (specs[i].content() || '') : '';
+			row.mailbox = mboxName;
+			row.account = accName;
+			result.push(row);
 		} catch (e) {
 			// Skip messages that cause errors
 		}
@@ -724,22 +802,9 @@ try {
 }
 
 JSON.stringify(result);
-`, escapeJSString(accountName), escapeJSString(mailboxName), unreadFilter, flaggedFilter, sinceFilter, offsetClause, limitClause, contentField)
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return nil, err
-	}
-
-	var messages []Message
-	if err := json.Unmarshal([]byte(output), &messages); err != nil {
-		return nil, fmt.Errorf("failed to parse messages JSON: %w", err)
-	}
-
-	return messages, nil
+`, withContent, resolveJS, unreadFilter, flaggedFilter, sinceFilter, offsetClause, limitClause, bulkProbeCap(limit))
 }
 
-// GetMessageDetailsJSON retrieves full details of a specific message
 func (c *Client) GetMessageDetailsJSON(accountName, mailboxName, messageID string) (*Message, error) {
 	script := fmt.Sprintf(`
 const mail = Application('Mail');
@@ -1487,6 +1552,11 @@ func (c *Client) BulkArchiveMessages(requests []struct {
 // sent/drafts/trash/junk use Mail.app's JXA special-mailbox accessors
 // (mail.sentMailboxes() etc.) which don't require per-message filtering.
 func (c *Client) GetUnifiedMessagesJSON(mailboxType string, limit, offset int, withContent bool) ([]Message, error) {
+	if !withContent {
+		if msgs, ok := c.indexUnified(mailboxType, limit, offset); ok {
+			return msgs, nil
+		}
+	}
 	switch mailboxType {
 	case "inbox", "unread", "flagged":
 		return c.getInboxBasedUnified(mailboxType, limit, offset, withContent)
@@ -1566,25 +1636,25 @@ var specialMailboxCandidates = map[string][]string{
 	"junk":   {"Junk", "Spam", "迷惑メール"},
 }
 
-// getSpecialMailboxUnified fetches messages from each account's sent/
-// drafts/trash/junk mailbox by matching candidate display names against
-// that account's mailbox tree, merging the results. No per-message
-// filtering is applied since these views don't need unread/flagged
-// filtering.
+// getSpecialMailboxUnified fetches each account's sent/drafts/trash/junk
+// mailbox (the first candidate display name that resolves) concurrently, one
+// osascript per account, then merges. A single script walking every account
+// in turn took ~70s across six accounts, since Mail answers one script's
+// Apple events strictly in sequence.
 func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int, withContent bool) ([]Message, error) {
 	candidates, ok := specialMailboxCandidates[mailboxType]
 	if !ok {
 		return nil, fmt.Errorf("unknown special mailbox type: %s", mailboxType)
 	}
 
+	accounts, err := c.GetAccountsJSON()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accounts: %w", err)
+	}
+
 	perLimit := limit + offset
 	if perLimit < 50 {
 		perLimit = 50
-	}
-
-	contentField := "content: '',"
-	if withContent {
-		contentField = "content: msg.content() || '',"
 	}
 
 	var namesJS strings.Builder
@@ -1595,65 +1665,47 @@ func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int,
 		fmt.Fprintf(&namesJS, "'%s'", escapeJSString(name))
 	}
 
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-const result = [];
-const candidateNames = [%s];
-`+jsResolveMailbox+`
-const accounts = mail.accounts();
-for (let a = 0; a < accounts.length; a++) {
-	const acc = accounts[a];
+	type result struct {
+		messages []Message
+		err      error
+	}
+	results := make(chan result, len(accounts))
+	for _, acc := range accounts {
+		go func(accountName string) {
+			resolve := fmt.Sprintf(`
+	const acc = getAccount('%s');
 	let mbox = null;
-	for (let n = 0; n < candidateNames.length; n++) {
-		mbox = resolveMailbox(acc, candidateNames[n]);
-		if (mbox) break;
-	}
-	if (!mbox) continue;
-
-	let messages;
-	try { messages = mbox.messages(); } catch(e) { continue; }
-	const accName = acc.name();
-	const mboxName = mbox.name();
-
-	// Cap per-mailbox before iterating
-	const cap = Math.min(messages.length, %d);
-
-	for (let k = 0; k < cap; k++) {
-		const msg = messages[k];
-		try { if (msg.deletedStatus()) continue; } catch(e) {}
-		try {
-			result.push({
-				id: String(msg.id()),
-				subject: msg.subject() || '',
-				sender: msg.sender() || '',
-				dateReceived: (msg.dateReceived() || new Date()).toISOString(),
-				dateSent: (msg.dateSent() || new Date()).toISOString(),
-				read: msg.readStatus(),
-				flagged: msg.flaggedStatus(),
-				flagIndex: msg.flagIndex(),
-				messageSize: 0,
-				%s
-				mailbox: mboxName,
-				account: accName
-			});
-		} catch(e) {}
-	}
-}
-
-JSON.stringify(result);
-`, namesJS.String(), perLimit, contentField)
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return nil, err
+	for (const n of [%s]) { mbox = resolveMailbox(acc, n); if (mbox) break; }
+	if (!mbox) throw 'Mailbox not found';`, escapeJSString(accountName), namesJS.String())
+			output, err := c.runJXA(messagesScript(resolve, perLimit, 0, false, false, withContent, ""))
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			var messages []Message
+			if err := json.Unmarshal([]byte(output), &messages); err != nil {
+				results <- result{err: fmt.Errorf("failed to parse %s messages JSON: %w", mailboxType, err)}
+				return
+			}
+			results <- result{messages: messages}
+		}(acc.Name)
 	}
 
-	var messages []Message
-	if err := json.Unmarshal([]byte(output), &messages); err != nil {
-		return nil, fmt.Errorf("failed to parse %s messages JSON: %w", mailboxType, err)
+	var all []Message
+	var errs []error
+	for range accounts {
+		res := <-results
+		if res.err != nil {
+			errs = append(errs, res.err)
+			continue
+		}
+		all = append(all, res.messages...)
+	}
+	if len(errs) > 0 && len(all) == 0 {
+		return nil, fmt.Errorf("failed to get %s messages from all accounts: %v", mailboxType, errs)
 	}
 
-	return sortAndSlice(messages, offset, limit), nil
+	return sortAndSlice(all, offset, limit), nil
 }
 
 // sortAndSlice sorts messages by date descending then applies offset and limit.
