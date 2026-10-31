@@ -84,8 +84,11 @@ var messagesListCmd = &cobra.Command{
 			msgWithContent,
 		)
 
+		// The index is fresher than any cache and about as fast to read.
+		useCache := !mail.IndexEnabled() || msgWithContent
+
 		// Try cache first (skip if content requested — content is per-user and typically large)
-		if !msgNoCache && !msgForceRefresh {
+		if useCache && !msgNoCache && !msgForceRefresh {
 			c, err := cache.New()
 			if err == nil {
 				c.SetTTL(messageCacheTTL)
@@ -109,7 +112,7 @@ var messagesListCmd = &cobra.Command{
 		}
 
 		// Populate cache (always write unless --no-cache)
-		if !msgNoCache {
+		if useCache && !msgNoCache {
 			if c, err := cache.New(); err == nil {
 				c.SetTTL(messageCacheTTL)
 				c.Set(cacheKey, messages)
